@@ -22,21 +22,6 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
     }
 }
 
-// Kernel: initialize RNG states
-__global__ void init_rng(curandState *state, unsigned long seed, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) curand_init(seed, idx, 0, &state[idx]);
-}
-
-// Kernel: add noise η(x) dt
-__global__ void add_noise(double *h, curandState *state, double Delta, double dt, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < N) {
-        double r = curand_normal_double(&state[idx]);
-        h[idx] += sqrt(dt) * Delta * r;
-    }
-}
-
 // Kernel: compute derivative u = ∂x h
 __global__ void compute_u(const double *h, double *u, double dx, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -47,17 +32,17 @@ __global__ void compute_u(const double *h, double *u, double dx, int N) {
     }
 }
 
-// Kernel: compute nonlinear flux F(u) = sign(u) |u|^(2n-1)
-__global__ void compute_flux(const double *u, double *F, int n, int N) {
+// Kernel: compute nonlinear flux F(u) = sign(u) * (|u|+eps)^(2n-1)
+__global__ void compute_flux(const double *u, double *F, int n, double eps, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
         double val = u[idx];
         double s = (val > 0) - (val < 0);
-        F[idx] = s * pow(fabs(val), 2*n - 1);
+        F[idx] = s * pow(fabs(val)+eps, 2*n - 1);
     }
 }
 
-// Kernel: compute derivative of flux dF/dx
+// Kernel: derivative of flux
 __global__ void compute_dFdx(const double *F, double *dFdx, double dx, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
@@ -67,11 +52,11 @@ __global__ void compute_dFdx(const double *F, double *dFdx, double dx, int N) {
     }
 }
 
-// Kernel: Euler update
-__global__ void euler_update(double *h, const double *dFdx, double dt, double nu, int N) {
+// Kernel: Euler update with quenched noise
+__global__ void euler_update(double *h, const double *dFdx, const double *eta, double dt, double nu, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
-        h[idx] += dt * nu * dFdx[idx];
+        h[idx] += dt * (nu*dFdx[idx] + eta[idx]);
     }
 }
 
@@ -88,24 +73,24 @@ __global__ void count_zeros(const double *u, int *counts, int N) {
     }
     local[tid] = val;
     __syncthreads();
-    for (int s = blockDim.x/2; s > 0; s >>= 1) {
-        if (tid < s) local[tid] += local[tid + s];
+    for (int s = blockDim.x/2; s > 0; s>>=1) {
+        if (tid < s) local[tid] += local[tid+s];
         __syncthreads();
     }
-    if (tid == 0) counts[blockIdx.x] = local[0];
+    if (tid==0) counts[blockIdx.x] = local[0];
 }
 
 // Host: sum zero crossings
 int get_zero_crossings(const double *u_d, int N) {
-    int blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int blocks = (N + BLOCK_SIZE -1)/BLOCK_SIZE;
     int *d_counts, *h_counts = new int[blocks];
-    gpuErrchk(cudaMalloc(&d_counts, blocks * sizeof(int)));
-    count_zeros<<<blocks,BLOCK_SIZE>>>(u_d, d_counts, N);
-    gpuErrchk(cudaMemcpy(h_counts, d_counts, blocks*sizeof(int), cudaMemcpyDeviceToHost));
-    int total = 0;
-    for (int i=0; i<blocks; i++) total += h_counts[i];
+    gpuErrchk(cudaMalloc(&d_counts, blocks*sizeof(int)));
+    count_zeros<<<blocks,BLOCK_SIZE>>>(u_d,d_counts,N);
+    gpuErrchk(cudaMemcpy(h_counts,d_counts,blocks*sizeof(int),cudaMemcpyDeviceToHost));
+    int total =0;
+    for(int i=0;i<blocks;i++) total += h_counts[i];
     cudaFree(d_counts);
-    delete [] h_counts;
+    delete[] h_counts;
     return total;
 }
 
@@ -120,127 +105,135 @@ void compute_structure_factor(double *u_d, int N, double L, const std::string &f
     gpuErrchk(cudaMemcpy(data_d, u_d, N*sizeof(double), cudaMemcpyDeviceToDevice));
     gpuErrchk(cudaMalloc(&fft_d, Nc*sizeof(cufftDoubleComplex)));
 
-    cufftPlan1d(&plan, N, CUFFT_D2Z, 1);
+    cufftPlan1d(&plan,N,CUFFT_D2Z,1);
     cufftExecD2Z(plan, data_d, fft_d);
 
     std::vector<double> Su(Nc);
     cufftDoubleComplex *fft_h = new cufftDoubleComplex[Nc];
     gpuErrchk(cudaMemcpy(fft_h, fft_d, Nc*sizeof(cufftDoubleComplex), cudaMemcpyDeviceToHost));
-    for (int k=0; k<Nc; k++) {
-        double re = fft_h[k].x;
-        double im = fft_h[k].y;
-        Su[k] = (re*re + im*im) / N;
+    for(int k=0;k<Nc;k++){
+        double re=fft_h[k].x;
+        double im=fft_h[k].y;
+        Su[k] = (re*re + im*im)/N;
     }
 
     std::ofstream fout(fname);
-    double dk = 2.0*M_PI/L;
-    for (int k=0; k<Nc; k++) {
+    double dk = 2*M_PI/L;
+    for(int k=0;k<Nc;k++){
         fout << k*dk << " " << Su[k] << "\n";
     }
     fout.close();
-
     cufftDestroy(plan);
-    cudaFree(data_d);
-    cudaFree(fft_d);
-    delete [] fft_h;
+    cudaFree(data_d); cudaFree(fft_d);
+    delete[] fft_h;
 }
 
-// -------------------- MAIN --------------------
-
-int main(int argc, char** argv) {
-    // Default parameters
-    int N = 1024;
-    double L = 100.0;
-    int n = 2;
-    double tmax = 10.0;
-    double dt = 0.01;
-    double nu = 1.0;
-    double Delta = 0.1;
-    unsigned long seed = 1234;
-    std::string rhoFile = "rho_vs_t.dat";
-    std::string SuFile  = "Su_final.dat";
+// ---------------- MAIN ------------------
+int main(int argc, char **argv) {
+    // Defaults
+    int N=1024, n=2, nout=100;
+    double L=100.0, tmax=10.0, dt=0.01, nu=1.0, Delta=0.05, epsfactor=1e-8;
+    double tmin=1e-6;
+    std::string rhoFile="rho_vs_t.dat", SuFile="Su_final.dat";
+    unsigned long seed=1234;
 
     static struct option long_options[] = {
-        {"N", required_argument, 0, 'N'},
-        {"L", required_argument, 0, 'L'},
-        {"n", required_argument, 0, 'n'},
-        {"tmax", required_argument, 0, 't'},
-        {"dt", required_argument, 0, 'd'},
-        {"nu", required_argument, 0, 'u'},
-        {"Delta", required_argument, 0, 'D'},
-        {"seed", required_argument, 0, 's'},
-        {"out", required_argument, 0, 'o'},
-        {"outSu", required_argument, 0, 'S'},
+        {"N", required_argument,0,'N'},
+        {"L", required_argument,0,'L'},
+        {"n", required_argument,0,'n'},
+        {"tmax", required_argument,0,'t'},
+        {"dt", required_argument,0,'d'},
+        {"nu", required_argument,0,'u'},
+        {"Delta", required_argument,0,'D'},
+        {"epsfactor", required_argument,0,'e'},
+        {"seed", required_argument,0,'s'},
+        {"nout", required_argument,0,'o'},
+        {"out", required_argument,0,'r'},
+        {"outSu", required_argument,0,'S'},
         {0,0,0,0}
     };
-
     int opt, idx;
-    while ((opt = getopt_long(argc, argv, "", long_options, &idx)) != -1) {
-        switch(opt) {
-            case 'N': N = atoi(optarg); break;
-            case 'L': L = atof(optarg); break;
-            case 'n': n = atoi(optarg); break;
-            case 't': tmax = atof(optarg); break;
-            case 'd': dt = atof(optarg); break;
-            case 'u': nu = atof(optarg); break;
-            case 'D': Delta = atof(optarg); break;
-            case 's': seed = atol(optarg); break;
-            case 'o': rhoFile = optarg; break;
-            case 'S': SuFile = optarg; break;
+    while((opt=getopt_long(argc,argv,"",long_options,&idx))!=-1){
+        switch(opt){
+            case 'N': N=atoi(optarg); break;
+            case 'L': L=atof(optarg); break;
+            case 'n': n=atoi(optarg); break;
+            case 't': tmax=atof(optarg); break;
+            case 'd': dt=atof(optarg); break;
+            case 'u': nu=atof(optarg); break;
+            case 'D': Delta=atof(optarg); break;
+            case 'e': epsfactor=atof(optarg); break;
+            case 's': seed=atol(optarg); break;
+            case 'o': nout=atoi(optarg); break;
+            case 'r': rhoFile=optarg; break;
+            case 'S': SuFile=optarg; break;
         }
     }
 
-    double dx = L / N;
+    double dx = L/N;
     int steps = int(tmax/dt);
 
-    // Allocate device memory
-    double *h_d, *u_d, *F_d, *dFdx_d;
-    gpuErrchk(cudaMalloc(&h_d, N*sizeof(double)));
-    gpuErrchk(cudaMalloc(&u_d, N*sizeof(double)));
-    gpuErrchk(cudaMalloc(&F_d, N*sizeof(double)));
-    gpuErrchk(cudaMalloc(&dFdx_d, N*sizeof(double)));
-    gpuErrchk(cudaMemset(h_d, 0, N*sizeof(double)));
+    // Device memory
+    double *h_d,*u_d,*F_d,*dFdx_d,*eta_d;
+    gpuErrchk(cudaMalloc(&h_d,N*sizeof(double)));
+    gpuErrchk(cudaMalloc(&u_d,N*sizeof(double)));
+    gpuErrchk(cudaMalloc(&F_d,N*sizeof(double)));
+    gpuErrchk(cudaMalloc(&dFdx_d,N*sizeof(double)));
+    gpuErrchk(cudaMalloc(&eta_d,N*sizeof(double)));
+    gpuErrchk(cudaMemset(h_d,0,N*sizeof(double)));
 
-    // RNG states
-    curandState *rng_d;
-    gpuErrchk(cudaMalloc(&rng_d, N*sizeof(curandState)));
-    int blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    init_rng<<<blocks,BLOCK_SIZE>>>(rng_d, seed, N);
+    // Initialize quenched noise
+    curandGenerator_t gen;
+    curandCreateGenerator(&gen,CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetPseudoRandomGeneratorSeed(gen,seed);
+    curandGenerateNormalDouble(gen,eta_d,N,0.0,Delta);
+    // subtract mean
+    std::vector<double> eta_h(N);
+    gpuErrchk(cudaMemcpy(eta_h.data(),eta_d,N*sizeof(double),cudaMemcpyDeviceToHost));
+    double mean=0.0;
+    for(int i=0;i<N;i++) mean+=eta_h[i];
+    mean/=N;
+    for(int i=0;i<N;i++) eta_h[i]-=mean;
+    gpuErrchk(cudaMemcpy(eta_d,eta_h.data(),N*sizeof(double),cudaMemcpyHostToDevice));
+    curandDestroyGenerator(gen);
+
+    int blocks = (N+BLOCK_SIZE-1)/BLOCK_SIZE;
+
+    // Output times (log spaced)
+    std::vector<double> t_out(nout);
+    double r = pow(tmax/tmin,1.0/(nout-1));
+    t_out[0]=tmin;
+    for(int i=1;i<nout;i++) t_out[i]=t_out[i-1]*r;
 
     std::ofstream fout(rhoFile);
-    for (int step=0; step<=steps; step++) {
-        double t = step*dt;
+    int next_out=0;
 
-        // Compute u, flux, dFdx
-        compute_u<<<blocks,BLOCK_SIZE>>>(h_d, u_d, dx, N);
-        compute_flux<<<blocks,BLOCK_SIZE>>>(u_d, F_d, n, N);
-        compute_dFdx<<<blocks,BLOCK_SIZE>>>(F_d, dFdx_d, dx, N);
+    for(int step=0;step<=steps;step++){
+        double t=step*dt;
 
-        // Update
-        euler_update<<<blocks,BLOCK_SIZE>>>(h_d, dFdx_d, dt, nu, N);
-        add_noise<<<blocks,BLOCK_SIZE>>>(h_d, rng_d, Delta, dt, N);
+        // compute derivatives
+        compute_u<<<blocks,BLOCK_SIZE>>>(h_d,u_d,dx,N);
+        compute_flux<<<blocks,BLOCK_SIZE>>>(u_d,F_d,n,epsfactor,N);
+        compute_dFdx<<<blocks,BLOCK_SIZE>>>(F_d,dFdx_d,dx,N);
+        euler_update<<<blocks,BLOCK_SIZE>>>(h_d,dFdx_d,eta_d,dt,nu,N);
 
-        // Zero crossings density
-        if (step % 10 == 0) {
-            int zeros = get_zero_crossings(u_d, N);
-            double rho = (double)zeros / L;
+        // output
+        if(next_out<nout && t>=t_out[next_out]){
+            int zeros = get_zero_crossings(u_d,N);
+            double rho = zeros/L;
             fout << t << " " << rho << "\n";
+            next_out++;
         }
     }
     fout.close();
 
-    // Compute structure factor
-    compute_structure_factor(u_d, N, L, SuFile);
+    // structure factor
+    compute_u<<<blocks,BLOCK_SIZE>>>(h_d,u_d,dx,N); // final u
+    compute_structure_factor(u_d,N,L,SuFile);
 
-    // Free
-    cudaFree(h_d);
-    cudaFree(u_d);
-    cudaFree(F_d);
-    cudaFree(dFdx_d);
-    cudaFree(rng_d);
+    cudaFree(h_d); cudaFree(u_d); cudaFree(F_d); cudaFree(dFdx_d); cudaFree(eta_d);
 
-    printf("Simulation done. Output written to %s and %s\n", rhoFile.c_str(), SuFile.c_str());
+    printf("Simulation done. Output: %s, %s\n",rhoFile.c_str(),SuFile.c_str());
     return 0;
 }
-
 
