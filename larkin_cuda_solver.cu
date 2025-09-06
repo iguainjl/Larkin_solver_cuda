@@ -20,25 +20,34 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
     }
 }
 
-// Kernels
-__global__ void compute_u(const double *h, double *u, double dx, int N) {
+// ---------------- Kernels ----------------
+
+// Compute derivative u = ∂x h
+// scheme = 0 -> forward difference, scheme = 1 -> central difference
+__global__ void compute_u(const double *h, double *u, double dx, int N, int scheme) {
     int idx = blockIdx.x*blockDim.x + threadIdx.x;
-    if(idx<N){
-        int ip = (idx+1)%N;
-        int im = (idx-1+N)%N;
-        u[idx]=(h[ip]-h[im])/(2.0*dx);
+    if (idx < N) {
+        int ip = (idx + 1) % N;
+        int im = (idx - 1 + N) % N;
+        if (scheme == 0) {
+            u[idx] = (h[ip] - h[idx]) / dx;  // forward
+        } else {
+            u[idx] = (h[ip] - h[im]) / (2.0 * dx);  // central
+        }
     }
 }
 
+// Nonlinear flux F(u) = sign(u) * (|u| + eps)^(2n-1)
 __global__ void compute_flux(const double *u, double *F, int n, double eps, int N){
     int idx = blockIdx.x*blockDim.x + threadIdx.x;
-    if(idx<N){
-        double val=u[idx];
-        double s=(val>0)-(val<0);
-        F[idx]=s*pow(fabs(val)+eps,2*n-1);
+    if(idx < N){
+        double val = u[idx];
+        double s = (val>0) - (val<0);
+        F[idx] = s * pow(fabs(val)+eps, 2*n-1);
     }
 }
 
+// Derivative of flux
 __global__ void compute_dFdx(const double *F, double *dFdx, double dx, int N){
     int idx = blockIdx.x*blockDim.x + threadIdx.x;
     if(idx<N){
@@ -48,14 +57,16 @@ __global__ void compute_dFdx(const double *F, double *dFdx, double dx, int N){
     }
 }
 
+// Euler update with quenched noise
 __global__ void euler_update(double *h, const double *dFdx, const double *eta, double dt, double nu, int N){
     int idx = blockIdx.x*blockDim.x + threadIdx.x;
-    if(idx<N) h[idx]+=dt*(nu*dFdx[idx]+eta[idx]);
+    if(idx<N) h[idx] += dt*(nu*dFdx[idx] + eta[idx]);
 }
 
+// Count zero crossings of u
 __global__ void count_zeros(const double *u, int *counts, int N){
     __shared__ int local[BLOCK_SIZE];
-    int idx=blockIdx.x*blockDim.x+threadIdx.x;
+    int idx=blockIdx.x*blockDim.x + threadIdx.x;
     int tid=threadIdx.x;
     int val=0;
     if(idx<N){
@@ -116,7 +127,7 @@ void compute_structure_factor(double *u_d,int N,double L,const std::string &fnam
 
 // ---------------- MAIN ----------------
 int main(int argc,char** argv){
-    int N=1024,n=2,nout=100;
+    int N=1024,n=2,nout=100, scheme=1;
     double L=100.0,tmax=10.0,dt=0.01,nu=1.0,Delta=0.05,epsfactor=1e-8;
     double tmin=1e-6;
     unsigned long seed=1234;
@@ -135,6 +146,7 @@ int main(int argc,char** argv){
         {"nout", required_argument,0,'o'},
         {"out", required_argument,0,'r'},
         {"outSu", required_argument,0,'S'},
+        {"scheme", required_argument,0,'c'},
         {0,0,0,0}
     };
     int opt,idx;
@@ -152,6 +164,7 @@ int main(int argc,char** argv){
             case 'o': nout=atoi(optarg); break;
             case 'r': rhoFile=optarg; break;
             case 'S': SuFile=optarg; break;
+            case 'c': scheme=atoi(optarg); break;
         }
     }
 
@@ -171,7 +184,6 @@ int main(int argc,char** argv){
     curandCreateGenerator(&gen,CURAND_RNG_PSEUDO_DEFAULT);
     curandSetPseudoRandomGeneratorSeed(gen,seed);
     curandGenerateNormalDouble(gen,eta_d,N,0.0,Delta);
-    // subtract mean
     std::vector<double> eta_h(N);
     gpuErrchk(cudaMemcpy(eta_h.data(),eta_d,N*sizeof(double),cudaMemcpyDeviceToHost));
     double mean=0.0;
@@ -195,7 +207,7 @@ int main(int argc,char** argv){
     for(int step=0;step<=steps;step++){
         double t=step*dt;
 
-        compute_u<<<blocks,BLOCK_SIZE>>>(h_d,u_d,dx,N);
+        compute_u<<<blocks,BLOCK_SIZE>>>(h_d,u_d,dx,N,scheme);
         compute_flux<<<blocks,BLOCK_SIZE>>>(u_d,F_d,n,epsfactor,N);
         compute_dFdx<<<blocks,BLOCK_SIZE>>>(F_d,dFdx_d,dx,N);
         euler_update<<<blocks,BLOCK_SIZE>>>(h_d,dFdx_d,eta_d,dt,nu,N);
@@ -212,7 +224,7 @@ int main(int argc,char** argv){
     fout.close();
 
     // structure factor
-    compute_u<<<blocks,BLOCK_SIZE>>>(h_d,u_d,dx,N);
+    compute_u<<<blocks,BLOCK_SIZE>>>(h_d,u_d,dx,N,scheme);
     gpuErrchk(cudaDeviceSynchronize());
     compute_structure_factor(u_d,N,L,SuFile);
 
