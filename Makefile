@@ -1,5 +1,5 @@
 NVCC = nvcc
-NVFLAGS = -O3 -arch=sm_75
+NVFLAGS = -O3 -arch=sm_75 -lcufft -lcurand
 
 all: larkin_cuda_solver
 
