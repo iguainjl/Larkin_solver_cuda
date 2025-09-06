@@ -114,7 +114,6 @@ void compute_structure_factor(double *u_d, int N, double L, const std::string &f
     cufftHandle plan;
     cufftDoubleReal *data_d;
     cufftDoubleComplex *fft_d;
-    size_t workSize;
     int Nc = N/2 + 1;
 
     gpuErrchk(cudaMalloc(&data_d, N*sizeof(double)));
