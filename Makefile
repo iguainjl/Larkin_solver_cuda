@@ -1,6 +1,5 @@
-CUDA_HOME ?= /usr/local/cuda
-NVCC = $(CUDA_HOME)/bin/nvcc
-NVFLAGS = -O3 -arch=sm_70
+NVCC = nvcc
+NVFLAGS = -O3 -arch=sm_75
 
 all: larkin_cuda_solver
 
